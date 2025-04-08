@@ -1,12 +1,15 @@
 import { AgentFeedback } from '#agent/agentFeedback';
 import { LiveFiles } from '#agent/liveFiles';
+import { BigQuery } from '#functions/cloud/google/bigquery';
 import { GoogleCloud } from '#functions/cloud/google/google-cloud';
+import { CustomFunctions } from '#functions/customFunctions';
 import { ImageGen } from '#functions/image';
 import { Jira } from '#functions/jira';
 import { GitHub } from '#functions/scm/github';
 import { GitLab } from '#functions/scm/gitlab';
-import { FileSystemRead } from '#functions/storage/FileSystemRead';
-import { FileSystemWrite } from '#functions/storage/FileSystemWrite';
+import { FileSystemList } from '#functions/storage/fileSystemList';
+import { FileSystemRead } from '#functions/storage/fileSystemRead';
+import { FileSystemWrite } from '#functions/storage/fileSystemWrite';
 import { LocalFileStore } from '#functions/storage/localFileStore';
 import { LlmTools } from '#functions/util';
 import { Perplexity } from '#functions/web/perplexity';
@@ -25,6 +28,7 @@ export function functionRegistry(): Array<new () => any> {
 	return [
 		AgentFeedback,
 		CodeEditingAgent,
+		FileSystemList,
 		FileSystemRead,
 		FileSystemWrite,
 		LocalFileStore,
@@ -41,6 +45,8 @@ export function functionRegistry(): Array<new () => any> {
 		PublicWeb,
 		NpmPackages,
 		TypescriptTools,
+		BigQuery,
+		CustomFunctions,
 		// Add your own classes below this line
 	];
 }

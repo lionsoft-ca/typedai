@@ -66,6 +66,9 @@ export const agentExecutions: Record<string, AgentExecution> = {};
 
 async function runAgent(agent: AgentContext): Promise<AgentExecution> {
 	let execution: AgentExecution;
+
+	await checkRepoHomeAndWorkingDirectory(agent);
+
 	switch (agent.type) {
 		case 'xml':
 			execution = await runXmlAgent(agent);
@@ -190,6 +193,21 @@ export async function resumeCompleted(agentId: string, executionId: string, inst
 	await runAgent(agent);
 }
 
+/**
+ * Restart a chatbot agent that was in the completed state
+ */
+export async function resumeCompletedWithUpdatedUserRequest(agentId: string, executionId: string, userRequest: string): Promise<void> {
+	const agent = await appContext().agentStateService.load(agentId);
+	if (agent.executionId !== executionId) throw new Error('Invalid executionId. Agent has already been resumed');
+
+	agent.inputPrompt = agent.inputPrompt.replace(agent.userPrompt, userRequest);
+	agent.userPrompt = userRequest;
+
+	agent.state = 'agent';
+	await appContext().agentStateService.save(agent);
+	await runAgent(agent);
+}
+
 export async function provideFeedback(agentId: string, executionId: string, feedback: string): Promise<void> {
 	const agent = await appContext().agentStateService.load(agentId);
 	if (agent.executionId !== executionId) throw new Error('Invalid executionId. Agent has already been provided feedback');
@@ -240,4 +258,29 @@ export function formatFunctionError(functionName: string, error: any): string {
         ${errorToString(error, false)}
         ${CDATA_END}</error>
         </function_results>`;
+}
+
+/**
+ * If the agent has been restarted on a different machine then update the working directory if required
+ * @param agent
+ */
+async function checkRepoHomeAndWorkingDirectory(agent: AgentContext) {
+	const fss = agent.fileSystem;
+	if (!fss) return;
+
+	const currentRepoDir = process.env.TYPEDAI_HOME || process.cwd();
+	if (!agent.typedAiRepoDir) {
+		// Migration for old agents
+		agent.typedAiRepoDir = currentRepoDir;
+	} else if (agent.typedAiRepoDir !== currentRepoDir) {
+		if (fss.getWorkingDirectory().startsWith(agent.typedAiRepoDir)) {
+			const originalDir = fss.getWorkingDirectory();
+			const updatedDir = originalDir.replace(agent.typedAiRepoDir, currentRepoDir);
+			logger.info(`Updating working directory from ${originalDir} to ${updatedDir}`);
+			fss.setWorkingDirectory(updatedDir);
+		}
+		agent.typedAiRepoDir = currentRepoDir;
+	}
+	const workDirExists = await fss.fileExists(fss.getWorkingDirectory());
+	if (!workDirExists) throw new Error(`Working directory ${fss.getWorkingDirectory()} does not exist`);
 }

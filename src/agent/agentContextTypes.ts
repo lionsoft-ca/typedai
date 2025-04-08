@@ -74,6 +74,8 @@ export interface AgentContext {
 	childAgents?: string[];
 	/** Id of the running execution. This changes after the agent restarts due to an error, pausing, human in loop, completion etc */
 	executionId: string;
+	/** The path to the TypedAI repo. i.e. TYPEDAI_HOME env variable or process.cwd() of the most recent execution. If the agent re-starts on a machine with a different value then the file system working directory can be updated. */
+	typedAiRepoDir: string;
 	/** Current OpenTelemetry traceId */
 	traceId: string;
 	/** Display name */
@@ -111,7 +113,6 @@ export interface AgentContext {
 
 	// ChatBot properties ----------------
 
-	messages: LlmMessage[];
 	/** Messages sent by users while the agent is still processing the last message */
 	pendingMessages: string[];
 
@@ -127,8 +128,10 @@ export interface AgentContext {
 	notes: string[];
 	/** The initial prompt provided by the user or parent agent */
 	userPrompt: string;
-	/** The prompt the agent execution started/resumed with */
+	/** The prompt the agent execution started/resumed with for codeGen/XML agent */
 	inputPrompt: string;
+	/** The message the agent execution started/resumed with for cachingCodeGen agent */
+	messages: LlmMessage[];
 	/** Completed function calls with success/error output */
 	functionCallHistory: FunctionCallResult[];
 	/** How many iterations of the autonomous agent control loop to require human input to continue */

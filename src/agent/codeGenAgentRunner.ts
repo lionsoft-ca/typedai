@@ -6,16 +6,16 @@ import { AgentContext } from '#agent/agentContextTypes';
 import { AGENT_REQUEST_FEEDBACK, REQUEST_FEEDBACK_PARAM_NAME } from '#agent/agentFeedback';
 import { AGENT_COMPLETED_NAME, AGENT_COMPLETED_PARAM_NAME, AGENT_SAVE_MEMORY_CONTENT_PARAM_NAME } from '#agent/agentFunctions';
 import { buildFunctionCallHistoryPrompt, buildMemoryPrompt, buildToolStatePrompt, updateFunctionSchemas } from '#agent/agentPromptUtils';
-import { AgentExecution, formatFunctionError, formatFunctionResult } from '#agent/agentRunner';
+import { AgentExecution } from '#agent/agentRunner';
+import { reviewPythonCode } from '#agent/codeGenAgentCodeReview';
 import { convertJsonToPythonDeclaration, extractPythonCode, removePythonMarkdownWrapper } from '#agent/codeGenAgentUtils';
-import { humanInTheLoop } from '#agent/humanInTheLoop';
 import { getServiceName } from '#fastify/trace-init/trace-init';
 import { FUNC_SEP, FunctionSchema, getAllFunctionSchemas } from '#functionSchema/functions';
 import { logger } from '#o11y/logger';
 import { withActiveSpan } from '#o11y/trace';
 import { errorToString } from '#utils/errors';
 import { appContext } from '../applicationContext';
-import { agentContext, agentContextStorage, llms } from './agentContextLocalStorage';
+import { agentContextStorage, llms } from './agentContextLocalStorage';
 import { HitlCounters, checkHumanInTheLoop } from './humanInTheLoopChecks';
 
 const stopSequences = ['</response>'];
@@ -114,6 +114,7 @@ export async function runCodeGenAgent(agent: AgentContext): Promise<AgentExecuti
 							id: 'Codegen agent plan',
 							stopSequences,
 							temperature: 0.5,
+							thinking: 'medium',
 						});
 						llmPythonCode = extractPythonCode(agentPlanResponse);
 					} catch (e) {
@@ -123,9 +124,13 @@ export async function runCodeGenAgent(agent: AgentContext): Promise<AgentExecuti
 							id: 'Codegen agent plan retry',
 							stopSequences,
 							temperature: 0.5,
+							thinking: 'medium',
 						});
 						llmPythonCode = extractPythonCode(agentPlanResponse);
 					}
+
+					// Review the generated function calling code
+					llmPythonCode = await reviewPythonCode(agentPlanResponse, functionsXml);
 
 					agent.state = 'functions';
 					await agentStateService.save(agent);
@@ -139,19 +144,67 @@ export async function runCodeGenAgent(agent: AgentContext): Promise<AgentExecuti
 					for (const schema of funcSchemas) {
 						const [className, method] = schema.name.split(FUNC_SEP);
 						jsGlobals[schema.name] = async (...args) => {
+							// logger.info(`args ${JSON.stringify(args)}`); // Can be very verbose
 							// The system prompt instructs the generated code to use positional arguments.
-							// If the generated code mistakenly uses named arguments then there will an arg
-							// which is an object with the property names matching the parameter names. This will cause an error
+							// however the generated code may use keyword args so we need to handle that case too.
 
 							// Un-proxy any JsProxy objects. https://pyodide.org/en/stable/usage/type-conversions.html
 							args = args.map((arg) => (typeof arg?.toJs === 'function' ? arg.toJs() : arg));
 
-							// Convert arg array to parameters name/value map
-							const parameters: { [key: string]: any } = {};
-							for (let index = 0; index < args.length; index++) parameters[schema.parameters[index].name] = args[index];
+							let finalArgs: any[]; // This will hold the arguments in the correct positional order for the JS call
+							const parameters: { [key: string]: any } = {}; // For logging history
 
+							const expectedParamNames = schema.parameters.map((p) => p.name);
+
+							// --- Argument Handling Logic ---
+							let isKeywordArgs = false;
+							// Check if the call *looks* like keyword arguments:
+							// 1. Exactly one argument was received from Pyodide.
+							// 2. That argument, after .toJs(), is a plain JavaScript object (not null, not an array).
+							// 3. The keys of that object are all valid parameter names for the target function.
+							if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null && !Array.isArray(args[0])) {
+								const potentialKwargs = args[0];
+								const receivedKeys = Object.keys(potentialKwargs);
+
+								// Check if *all* received keys are actual parameter names for this function
+								// AND ensure there's at least one key (don't treat {} as kwargs)
+								if (receivedKeys.length > 0 && receivedKeys.every((key) => expectedParamNames.includes(key))) {
+									isKeywordArgs = true;
+									logger.debug(`Detected keyword arguments for ${schema.name}: ${JSON.stringify(potentialKwargs)}`);
+								}
+							}
+
+							if (isKeywordArgs) {
+								const keywordArgs = args[0];
+								finalArgs = [];
+								// Reconstruct the arguments array in the order defined by the schema
+								for (const paramSchema of schema.parameters) {
+									const paramName = paramSchema.name;
+									// Get the value from the keyword args object, use undefined if missing
+									finalArgs.push(keywordArgs[paramName]);
+									// Populate parameters for logging history (only include provided keys)
+									if (Object.hasOwn(keywordArgs, paramName)) {
+										parameters[paramName] = keywordArgs[paramName];
+									}
+								}
+							} else {
+								// Assume positional arguments - use args directly
+								finalArgs = args;
+								logger.debug(`Assuming positional arguments for ${schema.name}: ${JSON.stringify(finalArgs)}`);
+								// Populate parameters for logging history based on position
+								for (let i = 0; i < finalArgs.length; i++) {
+									if (expectedParamNames[i]) {
+										// Check if a parameter name exists for this position
+										parameters[expectedParamNames[i]] = finalArgs[i];
+									} else {
+										// Handle extra positional args if necessary (though generally discouraged)
+										parameters[`arg_${i}`] = finalArgs[i]; // Log as generic arg_N
+									}
+								}
+							}
+							// --- End Argument Handling Logic ---
 							try {
-								const functionResponse = await functionInstances[className][method](...args);
+								const functionResponse = await functionInstances[className][method](...finalArgs);
 								// To minimise the function call history size becoming too large (i.e. expensive)
 								// we'll create a summary for responses which are quite long
 								// const outputSummary = await summariseLongFunctionOutput(functionResponse)
@@ -218,7 +271,7 @@ ${llmPythonCode
 	.join('\n')}
 
 main()`.trim();
-
+					let pythonError: Error | null = null;
 					try {
 						try {
 							// Initial execution attempt
@@ -245,25 +298,27 @@ main()`.trim();
 							}
 						}
 						logger.info(pythonScriptResult, 'Script result');
-
-						const lastFunctionCall = agent.functionCallHistory[agent.functionCallHistory.length - 1];
-
-						// Should force completed/requestFeedback to exit the script - throw a particular Error class
-						if (lastFunctionCall.function_name === AGENT_COMPLETED_NAME) {
-							logger.info(`Task completed: ${lastFunctionCall.parameters[AGENT_COMPLETED_PARAM_NAME]}`);
-							agent.state = 'completed';
-							completed = true;
-						} else if (lastFunctionCall.function_name === AGENT_REQUEST_FEEDBACK) {
-							logger.info(`Feedback requested: ${lastFunctionCall.parameters[REQUEST_FEEDBACK_PARAM_NAME]}`);
-							agent.state = 'feedback';
-							requestFeedback = true;
-						} else {
-							if (!anyFunctionCallErrors && !completed && !requestFeedback) agent.state = 'agent';
-						}
 					} catch (e) {
 						logger.info(e, `Caught function error ${e.message}`);
+						pythonError = e;
 						functionErrorCount++;
 					}
+
+					const lastFunctionCall = agent.functionCallHistory.length ? agent.functionCallHistory[agent.functionCallHistory.length - 1] : null;
+					logger.info(`Last function call was ${lastFunctionCall?.function_name}`);
+					// Should force completed/requestFeedback to exit the script - throw a particular Error class
+					if (lastFunctionCall?.function_name === AGENT_COMPLETED_NAME) {
+						logger.info(`Task completed: ${lastFunctionCall.parameters[AGENT_COMPLETED_PARAM_NAME]}`);
+						agent.state = 'completed';
+						completed = true;
+					} else if (lastFunctionCall?.function_name === AGENT_REQUEST_FEEDBACK) {
+						logger.info(`Feedback requested: ${lastFunctionCall.parameters[REQUEST_FEEDBACK_PARAM_NAME]}`);
+						agent.state = 'feedback';
+						requestFeedback = true;
+					} else {
+						if (!anyFunctionCallErrors && !completed && !requestFeedback) agent.state = 'agent';
+					}
+
 					// Function invocations are complete
 					// span.setAttribute('functionCalls', pythonCode.map((functionCall) => functionCall.function_name).join(', '));
 
@@ -274,7 +329,11 @@ main()`.trim();
 					agent.invoking = [];
 					const currentFunctionCallHistory = buildFunctionCallHistoryPrompt('results', 10000, currentFunctionHistorySize);
 
-					currentPrompt = `${oldFunctionCallHistory}\n${currentFunctionCallHistory}${buildMemoryPrompt()}${toolStatePrompt}\n${userRequestXml}\n${agentPlanResponse}\n<script-result>${pythonScriptResult}</script-result>\nReview the results of the script and make any observations about the output/errors, then proceed with the response.`;
+					const scriptResult = pythonError
+						? `<python-script>\n${pythonScript}\n</python-script>\n<script-error>\n${pythonError.message}\n</script-error>`
+						: `<script-result>${pythonScriptResult}</script-result>`;
+
+					currentPrompt = `${oldFunctionCallHistory}\n${currentFunctionCallHistory}${buildMemoryPrompt()}${toolStatePrompt}\n${userRequestXml}\n${agentPlanResponse}\n${scriptResult}\nReview the results of the script and make any observations about the output/errors, then proceed with the response.`;
 					currentFunctionHistorySize = agent.functionCallHistory.length;
 				} catch (e) {
 					span.setStatus({ code: SpanStatusCode.ERROR, message: e.toString() });
@@ -288,6 +347,7 @@ main()`.trim();
 					agent.iterations++;
 					await agentStateService.save(agent);
 				}
+
 				// return if the control loop should continue
 				return !(completed || requestFeedback || anyFunctionCallErrors || controlError);
 			});
